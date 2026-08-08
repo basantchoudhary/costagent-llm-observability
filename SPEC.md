@@ -4,6 +4,47 @@
 
 ---
 
+## 0 · Decision register
+
+Nine decisions on the table. **Nothing is agreed until you say so.**
+
+| # | Decision | Status |
+|---|---|---|
+| **D1** | `llm_calls` written to **Delta in UC**, synced to Postgres — not written to Postgres directly | open |
+| **D2** | One correlation id `run_id`, propagated to `llm_calls`, MLflow tags and the request payload | open · needs Q2 |
+| **D3** | MLflow autolog — **full for the assistant, ~1-in-20 for bulk**. Sampled for readability, not cost | open |
+| **D4** | **Blind-then-reveal** review, every finding. The flow does not exist, so we build it in Next.js | open |
+| **D5** | Realised saving reported as a **range with an attribution class**, never a single number | open |
+| **D6** | Offline eval **gates only validation and code** — the rest is reported | open |
+| **D7** | Prompt versioning by **content hash**, computed at load. Step zero | open |
+| **D8** | **The model never produces a number.** Every figure computed and templated | open |
+| **D9** | The valid/invalid threshold **moves with adoption**, as an explicit versioned setting | open |
+
+**My view on which matter most:** D8 (makes hallucinated savings structurally impossible),
+D4 (decides whether the labels are worth anything), D7 (nothing is attributable without it).
+D1 and D3 are reversible; argue about them last.
+
+---
+
+## 0b · Component × dimension
+
+The whole design on one grid. Detail per component in §5c.
+
+| | **Validation** | **Rec. (English)** | **Rec. (code)** | **Negative impact** | **RCA assistant** |
+|---|---|---|---|---|---|
+| **Mode** | Single call | Single call | Single call | Single call | **Agentic loop** |
+| **Volume** | Bulk, 1/finding | Bulk | Bulk | Bulk | Interactive |
+| **Payload capture** | Inference table | Inference table | Inference table | Inference table | Inference table |
+| **Fact row** | `llm_calls` | `llm_calls` | `llm_calls` | `llm_calls` | `llm_calls` per turn |
+| **Traces** | sampled 1:20 | sampled 1:20 | sampled 1:20 | sampled 1:20 | **full** |
+| **Offline ground truth** | Human labels (blind) | Assertions + judge | **Deterministic** | Past incidents | Labelled incidents |
+| **Offline gated?** | ✅ **yes** | report | ✅ **yes** | report | report |
+| **Online signal** | Reviewer verdict | Acted on? | Applied + ran? | Risk borne out? | Helped? |
+| **Headline metric** | Agreement rate | Acceptance rate | Applied rate | Miss rate | *This helped* rate |
+| **Worst failure** | Silently killing a real finding | Generic useless advice | Valid code, wrong effect | **False reassurance** | Confident answer, too few tool calls |
+
+---
+
 ## 1 · What exists today
 
 ```
@@ -407,6 +448,97 @@ agreement rate proves out.
 *Proposal:* make this an explicit, versioned setting rather than an emergent property of
 prompt wording — and report both error rates separately in the UI so the trade-off is
 visible to whoever owns it.
+
+---
+
+## 5c · Component by component
+
+Each block is what you would hand to whoever builds that piece.
+
+### 1 · Validation — *does this finding hold up?*
+
+| | |
+|---|---|
+| **In** | Finding + its evidence (metrics, resource, rule, confidence) |
+| **Out** | `valid` / `invalid` / `insufficient_evidence` + a reason grounded in the evidence |
+| **Observability** | `llm_calls` row · inference-table payload · trace sampled 1:20 |
+| **Offline** | Labelled findings from the **blind** review slice. Precision, recall, confusion matrix. **GATED** |
+| **Online** | Agreement rate — **reported separately for blind and non-blind** |
+| **Hallucination controls** | Enum output (it cannot invent a verdict) · grounded input only · a real refusal path |
+| **Worst failure** | **Silently killing a real finding.** Invisible, and it costs money |
+
+*The measurement nobody thinks of:* sample the findings validation **rejected** and review
+them anyway. Without that, the false-negative rate is unobservable by construction.
+
+---
+
+### 2 · Recommendation (English)
+
+| | |
+|---|---|
+| **In** | Validated finding + evidence + the computed saving |
+| **Out** | Prose with **every figure templated** (D8) |
+| **Observability** | `llm_calls` · inference table · trace 1:20 |
+| **Offline** | Assertions — names the resource · contains the templated figure · within length · makes no claim outside the rule. Then a judge for actionability. **Report only** |
+| **Online** | Acceptance rate — did anyone act on it |
+| **Hallucination controls** | Numbers templated · entity validation against the catalog |
+| **Worst failure** | **Plausible generic advice** — "consider rightsizing this cluster" — which passes every assertion and helps nobody |
+
+*The assertion that catches genericity:* the output must reference at least two specifics
+from the evidence — a resource id and a measured value. Generic advice cannot.
+
+---
+
+### 3 · Recommendation (code)
+
+| | |
+|---|---|
+| **In** | Finding + current config |
+| **Out** | A config or code diff |
+| **Observability** | `llm_calls` · inference table · trace 1:20 |
+| **Offline** | **Fully deterministic** — parses · resources exist · dry-run applies · changes what it claims. **GATED** |
+| **Online** | Applied rate, and success rate after applying |
+| **Hallucination controls** | Must parse · every referenced resource must exist |
+| **Worst failure** | **Syntactically valid code with the wrong effect** — the dry-run catches most of it, not all |
+
+*The cheapest eval in the whole system.* No labels, no judge, no humans. If only one thing
+gets built first, build this.
+
+---
+
+### 4 · Negative impact of the recommendation
+
+| | |
+|---|---|
+| **In** | Recommendation + workload context (SLAs, dependants, schedule) |
+| **Out** | Risks, or an explicit "no material risk identified" |
+| **Observability** | `llm_calls` · inference table · trace 1:20 |
+| **Offline** | Past changes that caused harm — **did it name the risk that actually materialised?** Report only |
+| **Online** | Was a stated risk borne out? **Were unstated risks borne out** — the miss rate |
+| **Hallucination controls** | Grounded in workload facts only · refusal path |
+| **Worst failure** | **False reassurance.** "No material risk" on a change that takes down a dashboard is worse than any other failure in this system |
+
+*Weight the miss rate above everything.* This is the only component where a confident wrong
+answer is more damaging than no answer, so it should be the most conservative — and it is
+the one where refusing to answer should be actively rewarded.
+
+---
+
+### 5 · Cost RCA assistant
+
+| | |
+|---|---|
+| **In** | A user question + tools over findings, billing, cluster history |
+| **Out** | An answer citing the tool results it used |
+| **Observability** | **Full MLflow trace** · one `llm_calls` row per turn · a session-level record |
+| **Offline** | Labelled cost incidents — top-1 cause accuracy · tool-selection precision · turns and cost per resolution · groundedness. Report only |
+| **Online** | *This helped* rate · abandonment · escalation to a human |
+| **Hallucination controls** | Every claim traceable to a tool result · entity validation · loop budget with no-progress detection |
+| **Worst failure** | **A confident answer after too few tool calls** — right-sounding, unsupported |
+
+*The metric that catches it:* **tool calls per answer.** An assistant answering complex cost
+questions in one turn is not being efficient, it is guessing. Track the distribution and be
+suspicious of the left tail.
 
 ---
 
