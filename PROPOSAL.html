@@ -380,6 +380,251 @@ row  = {"run_id": run_id, "finding_id": f.id,
   </div>
 </section>
 
+<!-- ===== COMPONENT 1 · VALIDATION ===== -->
+<section class="page">
+  <div class="ph">
+    <span class="k">Component 1</span>
+    <h2>Validation — <em>does this finding hold up?</em></h2>
+    <span class="s">Single LLM call &middot; bulk, one per finding &middot; <b>gated offline</b></span>
+  </div>
+
+  <div class="sect grid g2">
+    <div class="box"><b class="t">In → out</b>
+      <p class="n"><b>In:</b> finding, its evidence (metrics, resource, rule id, rule confidence)<br>
+      <b>Out:</b> enum — <code>valid</code> | <code>invalid</code> | <code>insufficient_evidence</code> — plus a reason grounded in the evidence</p>
+      <p class="n" style="margin-top:8px"><b>Purpose:</b> filter the rules engine's false positives before a human sees them.</p>
+    </div>
+    <div class="box tint"><b class="t">Worst failure</b>
+      <p class="n"><b>Silently killing a real finding.</b> A false positive is loud — someone reads bad advice and complains. A false negative is silent and costs money forever.</p>
+      <p class="n" style="margin-top:8px"><b>The measurement nobody builds:</b> sample the findings validation <em>rejected</em> and review them anyway. Without it the false-negative rate is unobservable by construction.</p>
+    </div>
+  </div>
+
+  <div class="sect">
+    <table>
+      <thead><tr><th style="width:16%">Dimension</th><th>Approach</th></tr></thead>
+      <tbody>
+        <tr><td><b>Offline eval</b></td><td><b>Dataset:</b> labelled findings from the <em>blind</em> review slice — target 200, usable at 50.<br>
+          <b>Method:</b> replay the prompt over a held-out split, compare to the human label.<br>
+          <b>Gated:</b> ✅ yes — build fails below the recall floor</td></tr>
+        <tr><td><b>Metrics</b></td><td><b>Recall</b> (weighted highest — misses cost money) · precision · F1 · full 2×2 confusion matrix · <b>confidence calibration</b> — is <code>valid</code> right more often than <code>insufficient</code>?</td></tr>
+        <tr><td><b>Online eval</b></td><td>Reviewer verdict → <b>agreement rate, reported separately for blind and non-blind.</b> Divergence between them measures label contamination.<br>Plus: a weekly sample of rejected findings, reviewed blind, to estimate the false-negative rate</td></tr>
+        <tr><td><b>Tech stack</b></td><td>Labels: <code>eval.validation_labels</code> (Delta) · harness: pytest + record/replay cassettes · runner: Databricks job or GitHub Actions · judge: none needed — real labels exist</td></tr>
+        <tr><td><b>Code changes</b></td><td>① <b>Enum output via tool schema</b> — also the injection defence<br>② write <code>llm_calls</code> row incl. <code>resp.id</code><br>③ prompt to file with content hash<br>④ pass evidence as structured fields, not prose</td></tr>
+        <tr><td><b>UI to build</b></td><td><b>Review screen</b> (blind-then-reveal) · <b>Validation quality tile</b>: agreement rate, confusion matrix, blind-vs-non-blind gap</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="foot">The only component with real labels and a binary answer — so it is the one worth gating.</div>
+</section>
+
+<!-- ===== COMPONENT 2 · RECOMMENDATION (ENGLISH) ===== -->
+<section class="page">
+  <div class="ph">
+    <span class="k">Component 2</span>
+    <h2>Recommendation (English)</h2>
+    <span class="s">Single LLM call &middot; bulk &middot; reported, not gated</span>
+  </div>
+
+  <div class="sect grid g2">
+    <div class="box"><b class="t">In → out</b>
+      <p class="n"><b>In:</b> validated finding, evidence, <b>the computed saving</b><br>
+      <b>Out:</b> prose in which <b>every figure is templated</b> (D8)</p>
+      <p class="n" style="margin-top:8px">The model writes the explanation. The pipeline supplies every number in it.</p>
+    </div>
+    <div class="box tint"><b class="t">Worst failure</b>
+      <p class="n"><b>Plausible generic advice.</b> "Consider rightsizing this cluster" passes every naive assertion, reads fine, and helps nobody.</p>
+      <p class="n" style="margin-top:8px"><b>The assertion that catches it:</b> the output must reference <b>at least two specifics</b> from the evidence — a resource id and a measured value. Generic advice cannot.</p>
+    </div>
+  </div>
+
+  <div class="sect">
+    <table>
+      <thead><tr><th style="width:16%">Dimension</th><th>Approach</th></tr></thead>
+      <tbody>
+        <tr><td><b>Offline eval</b></td><td><b>Assertions first</b> (deterministic, free): names the resource · contains the templated figure verbatim · ≥2 specifics from the evidence · within length · makes no claim outside the rule's scope.<br>
+          <b>Then a judge</b> on a 50-row sample for actionability. <b>Report only</b> — the judge is too noisy to gate on</td></tr>
+        <tr><td><b>Metrics</b></td><td>Assertion pass rate (target 100%) · <b>specificity score</b> — count of evidence references · judge actionability on the sample · readability length distribution</td></tr>
+        <tr><td><b>Online eval</b></td><td><b>Acceptance rate</b> — did anyone act on it · time-to-action · dismissal reasons where given</td></tr>
+        <tr><td><b>Tech stack</b></td><td>Assertions: plain Python in the harness · judge: the same Databricks serving endpoint, different prompt · dataset: <code>eval.recommendation_samples</code></td></tr>
+        <tr><td><b>Code changes</b></td><td>① <b>template every figure</b> — the single highest-value change if prompts currently ask for numbers<br>② pass evidence structured so the two-specifics assertion is checkable<br>③ entity validation against the catalog before storing</td></tr>
+        <tr><td><b>UI to build</b></td><td><b>Recommendation card</b> — accept / dismiss with a reason · <b>Acceptance trend</b> by rule and by resource type</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="foot">Judge last. Four deterministic assertions catch more than an LLM judge does, at no cost.</div>
+</section>
+
+
+<!-- ===== COMPONENT 3 · RECOMMENDATION (CODE) ===== -->
+<section class="page">
+  <div class="ph">
+    <span class="k">Component 3</span>
+    <h2>Recommendation (code)</h2>
+    <span class="s">Single LLM call &middot; bulk &middot; <b>gated — and fully deterministic</b></span>
+  </div>
+
+  <div class="sect grid g2">
+    <div class="box"><b class="t">In → out</b>
+      <p class="n"><b>In:</b> finding + the current configuration<br>
+      <b>Out:</b> a config or code diff</p>
+      <p class="n" style="margin-top:8px"><b>This is the cheapest eval in the whole system</b> — no labels, no judge, no humans. If only one thing gets built first, build this.</p>
+    </div>
+    <div class="box tint"><b class="t">Worst failure</b>
+      <p class="n"><b>Syntactically valid code with the wrong effect.</b> The dry-run catches most of it, not all.</p>
+      <p class="n" style="margin-top:8px">Which is why the diff goes to a human with a dry-run result attached, rather than being applied.</p>
+    </div>
+  </div>
+
+  <div class="sect">
+    <table>
+      <thead><tr><th style="width:16%">Dimension</th><th>Approach</th></tr></thead>
+      <tbody>
+        <tr><td><b>Offline eval</b></td><td><b>Four deterministic gates, no ground truth needed:</b><br>
+          ① <b>parses</b> — SQL via <code>sqlglot</code>, JSON/YAML natively, Python via <code>ast</code><br>
+          ② <b>every referenced resource exists</b> — catalog and Jobs API lookup<br>
+          ③ <b>dry-run applies cleanly</b><br>
+          ④ <b>changes what it claims</b> — diff the before/after config against the stated intent<br>
+          <b>Gated:</b> ✅ yes. These cannot be noisy</td></tr>
+        <tr><td><b>Metrics</b></td><td>Parse rate (100%) · resource-existence rate (100%) · dry-run success rate · <b>intent-match rate</b></td></tr>
+        <tr><td><b>Online eval</b></td><td><b>Applied rate</b> · post-apply success · <b>rollback rate</b> — the honesty metric</td></tr>
+        <tr><td><b>Tech stack</b></td><td><code>sqlglot</code> · <code>ast</code> · <code>yaml</code> · Databricks Jobs and UC APIs for existence and dry-run · no model involved in evaluation at all</td></tr>
+        <tr><td><b>Code changes</b></td><td>① emit a <b>structured diff</b>, not prose containing code<br>② run all four gates <b>before</b> storing — a failing diff never reaches the UI<br>③ record which gate failed in <code>llm_calls.status</code></td></tr>
+        <tr><td><b>UI to build</b></td><td><b>Diff viewer</b> — before/after, with the dry-run result and an apply button · <b>Gate results strip</b> showing all four checks</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="foot">Zero labels, zero judges, zero humans — and it catches the most embarrassing failures. Build it first.</div>
+</section>
+
+<!-- ===== COMPONENT 4 · NEGATIVE IMPACT ===== -->
+<section class="page">
+  <div class="ph">
+    <span class="k">Component 4</span>
+    <h2>Negative impact of the recommendation</h2>
+    <span class="s">Single LLM call &middot; bulk &middot; the most conservative component</span>
+  </div>
+
+  <div class="sect grid g2">
+    <div class="box"><b class="t">In → out</b>
+      <p class="n"><b>In:</b> recommendation + workload context — SLAs, downstream dependants, schedule, recent incidents<br>
+      <b>Out:</b> risks, <em>or</em> an explicit "no material risk identified"</p>
+    </div>
+    <div class="box tint"><b class="t">Worst failure — and it is the worst in the system</b>
+      <p class="n"><b>False reassurance.</b> "No material risk" on a change that then takes down a dashboard is more damaging than any other output this product can produce.</p>
+      <p class="n" style="margin-top:8px"><b>So weight the miss rate above everything</b>, and make refusing to answer an actively rewarded outcome.</p>
+    </div>
+  </div>
+
+  <div class="sect">
+    <table>
+      <thead><tr><th style="width:16%">Dimension</th><th>Approach</th></tr></thead>
+      <tbody>
+        <tr><td><b>Offline eval</b></td><td><b>Dataset:</b> past changes that caused harm — from incident history, joined to what changed.<br>
+          <b>Question:</b> given the recommendation, does it name <em>the risk that actually materialised</em>?<br>
+          Plus <b>planted traps</b>: recommendations on workloads with thin context. Does it say "insufficient context", or reassure?<br>
+          <b>Report only</b> — the dataset will be small for a long time</td></tr>
+        <tr><td><b>Metrics</b></td><td><b>Miss rate</b> — materialised risks it did not name (weighted highest) · false-alarm rate · <b>refusal rate on thin context</b> — a component that never refuses is a component that always reassures</td></tr>
+        <tr><td><b>Online eval</b></td><td>For every applied recommendation: was an incident raised within 7 days? Was it a risk we stated? <b>Unstated risks that materialised are the metric</b></td></tr>
+        <tr><td><b>Tech stack</b></td><td>Incident history joined to <code>llm_calls.applied_at</code> · workload context assembled from UC lineage and job config · no judge needed, outcomes are observable</td></tr>
+        <tr><td><b>Code changes</b></td><td>① <b>pass real workload context</b> — dependants, SLA, schedule. Without it the component is guessing<br>② make "insufficient context" a first-class output, not a failure<br>③ 7-day incident linkage job</td></tr>
+        <tr><td><b>UI to build</b></td><td><b>Risk panel</b> on the recommendation card, with the refusal shown honestly · <b>Miss log</b> — incidents that followed an applied recommendation we called safe</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="foot">
+    The only component where a confident wrong answer beats no answer — so it should be the least confident of the five.
+  </div>
+</section>
+
+<!-- ===== COMPONENT 5 · RCA ASSISTANT ===== -->
+<section class="page">
+  <div class="ph">
+    <span class="k">Component 5</span>
+    <h2>Cost RCA assistant</h2>
+    <span class="s"><b>Agentic loop</b> &middot; interactive, low volume &middot; the only component the model drives</span>
+  </div>
+
+  <div class="sect grid g2">
+    <div class="box"><b class="t">In → out</b>
+      <p class="n"><b>In:</b> a user question, plus tools over findings, billing, cluster history, job runs<br>
+      <b>Out:</b> an answer citing the tool results it used</p>
+      <p class="n" style="margin-top:8px">The only place the <em>model</em> chooses the next step — which is why it is the only place needing a loop budget.</p>
+    </div>
+    <div class="box tint"><b class="t">Worst failure</b>
+      <p class="n"><b>A confident answer after too few tool calls.</b> Right-sounding, unsupported, and indistinguishable from a good answer at a glance.</p>
+      <p class="n" style="margin-top:8px"><b>The metric that catches it: tool calls per answer.</b> An assistant answering complex cost questions in one turn is not being efficient — it is guessing. Watch the left tail of that distribution.</p>
+    </div>
+  </div>
+
+  <div class="sect">
+    <table>
+      <thead><tr><th style="width:16%">Dimension</th><th>Approach</th></tr></thead>
+      <tbody>
+        <tr><td><b>Offline eval</b></td><td><b>Dataset:</b> labelled cost incidents — question, true cause, the tools a competent analyst would use.<br>
+          <b>Trajectory eval:</b> not just the answer, the path. <b>Report only</b></td></tr>
+        <tr><td><b>Metrics</b></td><td>Top-1 cause accuracy · top-3 · <b>tool-selection precision</b> · turns and cost per resolution · <b>groundedness</b> — every claim traceable to a tool result · <b>tool-calls-per-answer distribution</b></td></tr>
+        <tr><td><b>Online eval</b></td><td><b><em>This helped</em> rate</b> · session abandonment · escalation to a human · cost per session</td></tr>
+        <tr><td><b>Tech stack</b></td><td><b>Full MLflow tracing</b> (not sampled — volume is low and traces are the debugging surface) · agent loop with <code>LoopBudget</code> · tool registry with per-user scoping · one <code>llm_calls</code> row per turn plus a session record</td></tr>
+        <tr><td><b>Code changes</b></td><td>① <b>loop budget</b> — turns, cost, wall-clock, <b>no-progress detection</b><br>② tool authorisation at execution, not planning<br>③ <b>citation enforcement</b> — claims must reference a tool result<br>④ session record linking the turns</td></tr>
+        <tr><td><b>UI to build</b></td><td><b>Chat panel</b> with <b>visible tool calls</b> — the user sees what it looked at · citations linking back to findings · thumbs + free-text feedback · a <b>"stopped because…"</b> banner when a budget fires</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="foot">
+    Showing the tool calls in the UI is not a debugging nicety — it is how a user judges whether to trust the answer.
+  </div>
+</section>
+
+<!-- ===== UI INVENTORY ===== -->
+<section class="page">
+  <div class="ph">
+    <span class="k">UI</span>
+    <h2>Screens to build in the Next.js app</h2>
+    <span class="s">Everything the persona sees &middot; nine views, three audiences</span>
+  </div>
+
+  <table>
+    <thead><tr>
+      <th style="width:5%">#</th><th style="width:20%">Screen</th><th style="width:13%">Audience</th>
+      <th style="width:16%">Reads from</th><th>What it shows</th>
+    </tr></thead>
+    <tbody>
+      <tr class="grp2"><td colspan="5">Core — the review loop</td></tr>
+      <tr class="hi"><td>1</td><td><b>Review screen</b> — blind-then-reveal</td><td>Reviewer</td><td>findings + <code>llm_calls</code></td><td>Finding, evidence, saving. Reviewer records their call <b>before</b> the LLM verdict is revealed. This screen <b>is</b> the labelling pipeline</td></tr>
+      <tr><td>2</td><td><b>Recommendation card</b></td><td>Reviewer</td><td><code>llm_calls</code></td><td>Prose recommendation, accept / dismiss with reason, risk panel, and the code diff if there is one</td></tr>
+      <tr><td>3</td><td><b>Diff viewer</b></td><td>Engineer</td><td><code>llm_calls</code></td><td>Before/after config, all four gate results, dry-run output, apply button</td></tr>
+      <tr><td>4</td><td><b>RCA chat</b></td><td>Analyst</td><td>agent loop</td><td>Conversation with <b>visible tool calls</b>, citations back to findings, feedback, and a "stopped because…" banner</td></tr>
+
+      <tr class="grp2"><td colspan="5">Quality — is it any good?</td></tr>
+      <tr><td>5</td><td><b>Validation quality</b></td><td>Owner</td><td>views over <code>llm_calls</code></td><td>Agreement rate <b>split blind vs non-blind</b>, confusion matrix, false-negative estimate from the rejected sample</td></tr>
+      <tr><td>6</td><td><b>Recommendation quality</b></td><td>Owner</td><td>views</td><td>Acceptance rate by rule and resource type, assertion pass rate, applied and rollback rates</td></tr>
+      <tr><td>7</td><td><b>Miss log</b></td><td>Owner</td><td>incidents ⋈ <code>llm_calls</code></td><td>Incidents that followed a recommendation we called safe. Short, and the most important list here</td></tr>
+
+      <tr class="grp2"><td colspan="5">Cost — does it pay for itself?</td></tr>
+      <tr class="hi"><td>8</td><td><b>Self-cost</b></td><td>Exec / owner</td><td><code>llm_calls</code> ⋈ <code>system.billing</code></td><td><b>Spend ÷ savings identified</b> · cost per finding, per validated finding, per accepted recommendation · <b>cost per component against its acceptance rate</b> · CostAgent's own jobs run through CostAgent's own rules</td></tr>
+      <tr><td>9</td><td><b>Realised saving</b></td><td>Exec / finance</td><td>billing join</td><td>Attributable range, unattributable count, predicted vs realised — <b>never a single confident number</b></td></tr>
+    </tbody>
+  </table>
+
+  <div class="sect grid g3" style="margin-top:15px">
+    <div class="box tint"><b class="t">Build screen 1 first</b><p class="n">It is not just a UI — it <b>is the labelling pipeline</b>. Every other quality metric in this document depends on it existing. Labels start accruing the day it ships.</p></div>
+    <div class="box tint"><b class="t">Then screen 8</b><p class="n">Best value for effort. The data already exists; nothing has to be built first; and "CostAgent finds waste in CostAgent" is the most convincing thing this product can show.</p></div>
+    <div class="box tint"><b class="t">The persona never opens MLflow</b><p class="n">Traces are an engineering tool. Everything on this page reads from <code>llm_calls</code> via Lakebase — which is why that table has to reach Postgres as well as Delta.</p></div>
+  </div>
+
+  <div class="foot">
+    Nine screens, but only two are urgent.
+    <span>Screen 1 makes measurement possible at all; screen 8 makes the case for the whole system.</span>
+  </div>
+</section>
+
+
 <!-- ===================== 4 · BUILD ORDER ===================== -->
 <section class="page">
   <div class="ph">
