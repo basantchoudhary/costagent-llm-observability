@@ -87,28 +87,59 @@ call-site changes.
 it is now a single line at the top of the job.
 
 *Counter:* autolog on a bulk job that makes thousands of calls will create thousands of
-traces. That is noise, and possibly a cost. May need sampling for the bulk path and full
-tracing only for the assistant.
+traces.
 
-*Proposal:* **autolog on for the assistant, sampled (say 1 in 20) for the bulk calls.**
+**On cost — sized rather than assumed.** A trace with full payload is roughly 3–5 KB. At
+10,000 findings × 4 calls = 40k traces per run, run daily, that is about **6 GB/month** —
+pennies in object storage. The tracing overhead itself is a logging write and is negligible.
+**Storage is not a reason to sample.**
+
+*To verify, not assume:* whether your Databricks tier meters **MLflow trace ingestion**
+(this has changed with MLflow 3 / managed MLflow, and differs between Free Edition and
+paid), and whether inference tables bill as ordinary Delta storage in your catalog.
+
+*The real reason to sample is signal-to-noise.* Forty thousand near-identical bulk traces
+are unusable — nobody scrolls that. Sample so the trace UI stays browsable.
+
+*Proposal:* **autolog full for the assistant, sampled (say 1 in 20) for the bulk calls.**
 `llm_calls` carries every row regardless; traces are for debugging, not accounting.
 
 ---
 
-### D4 · Labels come from the review that already happens
+### D4 · Blind-then-reveal review — and we build the flow, because none exists
 
-Every finding is reviewed by a person. That verdict is the label. No separate labelling
-project.
+**Confirmed: there is no finding review flow today.** The original plan — instrument the
+review that already happens — has nothing to instrument. The flow has to be built, and it
+becomes part of this work rather than a dependency of it.
 
-*Counter — and this one is serious:* **anchoring.** A reviewer who sees "the LLM says this
-finding is valid" is biased toward agreeing. The resulting dataset measures compliance, not
-accuracy.
+That is a setback and an opportunity. Retrofitting unbiased labelling onto an existing
+review is painful; designing it in from the start costs nothing.
 
-*Proposal:* for a **10% blind sample**, hide the LLM's verdict until after the human
-records theirs. Measure agreement on the blind slice separately. If blind and non-blind
-agreement diverge, the non-blind labels are contaminated and we know by how much.
+**Proposal: blind-then-reveal, for every finding — not a 10% sample.**
 
----
+```
+reviewer opens a finding
+   → sees: rule, resource, evidence, predicted saving          (the LLM verdict is HIDDEN)
+   → records their own call: valid | not valid | unsure
+   → THEN the LLM's verdict and recommendation are revealed
+   → optional second field: did the LLM change your mind?
+```
+
+*Why this beats a blind sample:* every label is clean, not one in ten. And the reviewer
+still gets the LLM's value — a moment later, framed as a comparison rather than a
+suggestion. "Did the AI agree with you?" is engaging; "here is what the AI thinks, do you
+concur?" is anchoring.
+
+*Why it beats blind-always:* the reviewer keeps the assistance the product exists to
+provide. Only the *order* changes.
+
+*Counter:* one extra click, and some reviewers will resent feeling tested. Mitigation is
+framing — this is calibration, and it is genuinely useful to them. If adoption suffers,
+fall back to a blind sample and accept contaminated labels on the rest.
+
+*Consequence for the build order:* the review flow moves from "instrument existing" to
+"design and build", and it becomes **step 2** — before any eval code, because labels are
+the input everything else needs.
 
 ### D5 · Realised saving is the headline metric — with attribution stated honestly
 
@@ -135,6 +166,31 @@ classification with real labels — gate it. **Code recommendations** get determ
 assertions (does it parse, do the resources exist) — gate those too, they cannot be noisy.
 English recommendations and impact analysis get **reported, not gated**, until the dataset
 is large enough to be stable.
+
+---
+
+### D7 · Prompt versioning by content hash, not by hand
+
+**Confirmed: prompts are not versioned today.** This is step zero — without it no quality
+change can be attributed to a prompt change, and every metric in this document becomes
+uninterpretable the first time someone edits a string.
+
+**Proposal:** prompts move out of inline strings into files, and the version is a
+**content hash computed at load**, not a number someone remembers to bump.
+
+```python
+PROMPTS = load_prompts("prompts/")          # prompts/validate.md, recommend_en.md, ...
+prompt_version = f"{name}@{sha256(template)[:12]}"     # validate@a3f91c2b7e04
+```
+
+*Why a hash rather than semver:* nobody forgets to bump a hash. It changes exactly when the
+prompt changes, and never when it does not. A human-readable name is carried alongside for
+legibility.
+
+*Counter:* a hash is opaque in a dashboard, and it changes on a whitespace edit. Mitigation:
+carry both — `validate@a3f91c2b` for correctness, plus an optional label for humans.
+
+*This is the one item with no argument against doing it first.*
 
 ---
 
@@ -185,6 +241,25 @@ CREATE TABLE costagent.observability.llm_calls (
 Three columns carry the weight: **`prompt_version`** (no attribution without it),
 **`blind`** (no trustworthy labels without it), **`attribution`** (no honest saving number
 without it).
+
+---
+
+## 3b · Who looks at what
+
+Confirmed: the UI is **Next.js hosted as a Databricks App**, and the persona works there.
+
+| Audience | Surface | Fed by | Cares about |
+|---|---|---|---|
+| **Persona** — reviews findings, judges quality | **Next.js Databricks App** | `llm_calls` via Lakebase Postgres | Is this finding real? Did the recommendation help? |
+| **Engineer** — debugging a bad output | MLflow trace UI | MLflow traces | Why did this specific call go wrong? |
+| **Finance / exec** | A view in the same app | `llm_calls` ⋈ billing | Realised saving, and what the intelligence costs |
+
+**The persona will never open MLflow.** That settles two things: traces are an engineering
+tool rather than a product surface, and the blind-then-reveal flow in D4 is **a screen we
+design in Next.js**, not a Databricks feature we switch on.
+
+It also reinforces D1 — `llm_calls` has to reach Postgres for the app *and* Delta for the
+billing join, which is exactly why it is written to Delta and synced.
 
 ---
 
@@ -251,12 +326,13 @@ the difference between having a golden set and permanently intending to build on
 
 | # | Question | Blocks |
 |---|---|---|
-| Q1 | **Findings table schema** — column names and types | `llm_calls` foreign keys |
-| Q2 | Does Model Serving pass custom request fields through to the inference table? | D2 — five-minute test |
+| Q1 | Findings table schema. **A unique finding id exists** — but is it *stable across runs*, or regenerated each time? | The realised-saving join. If ids churn, a finding cannot be tracked to an outcome 30 days later |
+| Q2 | Does Model Serving pass custom request fields through to the inference table? | D2 — five-minute test, can run against Free Edition |
 | Q3 | Are inference tables already enabled on the endpoints? | Whether payload capture exists today |
 | Q4 | Is the Lakebase sync scheduled or continuous? | D1 — UI freshness |
-| Q5 | Are prompts versioned anywhere today? | `prompt_version` — if not, this is step zero |
-| Q6 | Who reviews findings, and in which UI? | D4 — where the blind slice is implemented |
+| Q7 | Does your Databricks tier meter MLflow trace ingestion? | D3 — sampling rate |
+| ~~Q5~~ | ~~Are prompts versioned?~~ **No.** Content-hash versioning is step zero — see D7 | closed |
+| ~~Q6~~ | ~~Who reviews findings, and where?~~ **No flow exists.** We build it in the Next.js app — see D4 | closed |
 
 ---
 
