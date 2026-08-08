@@ -322,6 +322,94 @@ the difference between having a golden set and permanently intending to build on
 
 ---
 
+## 5b · Hallucination and false positives
+
+Two different problems with different owners, routinely conflated.
+
+**False-positive findings come from the rules engine**, which is deterministic. That is
+rule tuning, not hallucination. **Hallucination is the LLM inventing something** the
+evidence does not support. The validation step sits between them — it exists to catch rule
+false positives, and it can hallucinate while doing so, in both directions.
+
+### D8 · The model never produces a number
+
+Every figure in the output — predicted saving, current spend, node count, hours idle — is
+**computed by the pipeline and templated in**. The model writes prose around numbers it
+cannot change.
+
+```
+✗  "You could save roughly $400/month by downsizing this cluster"
+       the model invented $400
+
+✓  "You could save {{predicted_saving}} by downsizing {{resource}} from
+    {{current_size}} to {{recommended_size}}"
+       every figure supplied by the pipeline
+```
+
+*Why this is the single strongest control:* it makes a hallucinated saving **structurally
+impossible** rather than unlikely. Everything below is second-order.
+
+*Counter:* templated prose reads stiffer than generated prose, and the model cannot express
+a nuance the template did not anticipate. Mitigation: let it choose *which* template and
+write the surrounding explanation freely — it just cannot mint a figure.
+
+### Controls, by how much they can be trusted
+
+| Control | Mechanism | Deterministic? |
+|---|---|---|
+| **Numbers templated** | Model emits no figures | ✅ |
+| **Grounded input only** | It sees the finding's evidence and nothing else — no retrieval, no memory | ✅ |
+| **Constrained output** | JSON schema or tool call; it can only emit fields we defined | ✅ |
+| **Entity validation** | Every resource id in the output must exist in the catalog — a set difference | ✅ |
+| **Code must parse** | Syntax check · resources exist · dry-run applies | ✅ |
+| **A real refusal path** | "Insufficient evidence" is a valid, non-penalised answer | ✅ |
+| Prompt instruction not to invent | Words | ❌ weakest — never rely on it alone |
+
+### Measuring hallucination
+
+| Metric | How | Target |
+|---|---|---|
+| **Entity grounding rate** | % of resource ids in the output that exist | 100% |
+| **Numeric fidelity** | % of figures matching a computed value | 100% by construction — anything less means the template broke |
+| **Refusal appropriateness** | **Traps planted in the eval set** — findings with missing, thin or contradictory evidence | It must say "insufficient" |
+| Claim support | LLM judge, per sentence, against the evidence | Last resort, for what the above cannot see |
+
+**Plant the traps deliberately.** An eval set containing only well-evidenced findings cannot
+detect confabulation. Ten deliberately under-evidenced findings will, and
+**a model that never refuses is a model that always invents.**
+
+### Reducing rule false positives
+
+Ordinary engineering, and none of it involves a model:
+
+- **Emit evidence and confidence, not just a verdict** — the LLM needs something to validate
+  against, and so does the reviewer
+- **Sample-size guards** — do not flag a cluster on two days of data
+- **Exclusion lists** — a dev cluster meant to sit idle is not waste
+- **Seasonality** — a monthly spike is not a leak
+- **Cross-rule dedupe** — two rules firing on one cause is one finding
+
+### D9 · The threshold moves with adoption, deliberately
+
+| | LLM says **valid** | LLM says **invalid** |
+|---|---|---|
+| **Actually valid** | ✓ correct pass | ✗ **lost saving** — silent |
+| **Actually invalid** | ✗ **wasted trust** — loud | ✓ correct filter |
+
+The two errors are not symmetric, and which one hurts more **changes over time**.
+
+*Early:* wasted trust dominates. One bad finding and people stop opening the app. Filter
+aggressively; accept losing real findings.
+
+*Once trusted:* lost saving dominates, because it is invisible. Relax the filter as
+agreement rate proves out.
+
+*Proposal:* make this an explicit, versioned setting rather than an emergent property of
+prompt wording — and report both error rates separately in the UI so the trade-off is
+visible to whoever owns it.
+
+---
+
 ## 6 · Open questions
 
 | # | Question | Blocks |
