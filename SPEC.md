@@ -11,7 +11,8 @@ Nine decisions on the table. **Nothing is agreed until you say so.**
 | # | Decision | Status |
 |---|---|---|
 | **D1** | `llm_calls` written to **Delta in UC**, synced to Postgres — not written to Postgres directly | open |
-| **D2** | One correlation id `run_id`, propagated to `llm_calls`, MLflow tags and the request payload | open · needs Q2 |
+| **D2** | Correlate by **capturing the response `id`** into `llm_calls` — custom request fields are rejected (**tested**) | **evidence-backed** |
+| **D2b** | Plan for inference tables being **unavailable**. `llm_calls` is the primary record | open · needs Q8 |
 | **D3** | MLflow autolog — **full for the assistant, ~1-in-20 for bulk**. Sampled for readability, not cost | open |
 | **D4** | **Blind-then-reveal** review, every finding. The flow does not exist, so we build it in Next.js | open |
 | **D5** | Realised saving reported as a **range with an attribution class**, never a single number | open |
@@ -112,21 +113,58 @@ app needs sub-second freshness on LLM telemetry, this is wrong.
 
 ---
 
-### D2 · One correlation id, `run_id`, propagated everywhere
+### D2 · Correlate by pulling their id into our table — not pushing ours into their log
 
-Generated once per pipeline run. Stamped on: every `llm_calls` row, every MLflow trace tag,
-and — if serving supports it — the request payload so it lands in the inference table.
+**Tested on Free Edition, 2026-08-08. The original plan does not work.**
 
-*Why:* without it, an inference-table row cannot be linked to a finding, and the whole
-observability story collapses to "we have logs".
+```
+correlation_id      → 400  json: unknown field "correlation_id"
+metadata            → 400  json: unknown field "metadata"
+databricks_options  → 400  json: unknown field "databricks_options"
+user  (OpenAI std)  → 200  ✓ the only in-band metadata channel
+X-Correlation-Id    → 200  accepted as a header; whether it is logged is unverifiable here
+```
 
-*Counter:* putting an id in the request payload pollutes the prompt and may affect the
-model's output. Better in a metadata field if one exists.
+Databricks Model Serving **rejects arbitrary request fields**. There is no metadata object.
 
-*Open:* does Databricks Model Serving pass `extra_body` / custom fields through to the
-inference table, or are they stripped? **This needs a five-minute test.**
+**Revised proposal — reverse the join direction.** The chat completion response carries an
+`id`. Capture it into `llm_calls.request_id` at the call site. Any payload log can then be
+joined to our fact table on that id, and we never have to smuggle anything into the request.
+
+```python
+resp = client.chat.completions.create(...)
+row = {"run_id": run_id, "finding_id": f.id, "request_id": resp.id, ...}
+```
+
+*Why this is better than what it replaces:* it needs no vendor support, cannot be broken by
+a schema change, works identically against Kong or Azure OpenAI, and it makes `llm_calls`
+the system of record rather than a supplement.
+
+*Keep the `user` field as a belt-and-braces channel* — `user="run:{run_id}"` costs nothing
+and is a standard OpenAI parameter, so it survives a provider change.
 
 ---
+
+### D2b · Inference tables may not exist at all — plan for their absence
+
+```
+PUT /serving-endpoints/{ep}/ai-gateway  →  404 FEATURE_DISABLED
+  "Inference table is not currently supported for this endpoint type in this workspace"
+  endpoint_type: FOUNDATION_MODEL_API
+  ai_gateway:    {"usage_tracking_config": {"enabled": true}}
+```
+
+On **foundation-model (pay-per-token) endpoints**, payload logging could not be enabled.
+Usage tracking is on, so `system.serving.*` still gives spend and volume — but not
+request/response bodies.
+
+**This must be checked against CostAgent's actual endpoints (Q8).** Custom served entities
+and provisioned-throughput endpoints generally do support inference tables; foundation-model
+endpoints in this workspace do not.
+
+*Consequence either way:* `llm_calls` is **the primary record, not a supplement**. If
+inference tables turn out to be available, they are a bonus for full-payload debugging. The
+design must not depend on them — and with D2's reversed join, it does not.
 
 ### D3 · MLflow autolog for tracing — one line, because they use the OpenAI client
 
@@ -660,9 +698,10 @@ an enhancement rather than a dependency, which is what keeps it replaceable.
 
 | # | Question | Blocks |
 |---|---|---|
-| Q1 | Findings table schema. **A unique finding id exists** — but is it *stable across runs*, or regenerated each time? | The realised-saving join. If ids churn, a finding cannot be tracked to an outcome 30 days later |
-| Q2 | Does Model Serving pass custom request fields through to the inference table? | D2 — five-minute test, can run against Free Edition |
-| Q3 | Are inference tables already enabled on the endpoints? | Whether payload capture exists today |
+| ~~Q1~~ | ~~Is `finding_id` stable across runs?~~ **Treated as stable; will be made stable if it is not.** | closed |
+| ~~Q2~~ | ~~Custom request fields?~~ **Tested: rejected with 400.** Only the OpenAI `user` field is accepted. See D2 | closed |
+| Q3 | Are inference tables enabled on CostAgent's endpoints? | Payload capture |
+| **Q8** | **What endpoint type does CostAgent use** — `FOUNDATION_MODEL_API`, provisioned throughput, or a custom served entity? | **D2b.** Foundation-model endpoints could not have inference tables enabled in this workspace |
 | Q4 | Is the Lakebase sync scheduled or continuous? | D1 — UI freshness |
 | Q7 | Does your Databricks tier meter MLflow trace ingestion? | D3 — sampling rate |
 | ~~Q5~~ | ~~Are prompts versioned?~~ **No.** Content-hash versioning is step zero — see D7 | closed |
