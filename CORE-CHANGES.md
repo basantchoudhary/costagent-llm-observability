@@ -18,7 +18,7 @@ These answer the spec's open questions and may change the design.
 | **A5** | **Do prompts ask the model to produce numbers?** | D8. If yes, this is the highest-value change in the list | Read the recommendation prompt |
 | **A6** | What does validation return — free text, or a constrained value? | D11. A free-text verdict is injection-exposed; an enum is not | Read the parsing code |
 | **A7** | Are cluster names / job names / tags passed into prompts unmodified? | D11. These are user-written | Read the prompt construction |
-| **A8** | Is the Lakebase sync scheduled or continuous? | D1 — how fresh the UI can be | Sync/job config |
+| **A8** | Confirm **billing usage is in Lakebase bronze** and check its freshness | D1 — the realised-saving join depends on it | Lakebase schema |
 | **A9** | How many LLM calls does a typical run make? | D12 — whether a budget cap is urgent or theoretical | Count findings × call types |
 | **A10** | Is there any retry/timeout handling around the calls? | D14 — what happens today when the endpoint is down | Read the call wrapper |
 
@@ -78,7 +78,7 @@ If the pipeline already has a run identifier, reuse it rather than inventing ano
 ### B4 · Write `llm_calls`
 
 One row per call, written in the same step that makes the call — not reconciled from logs
-afterwards. Schema in [SPEC.md §3](SPEC.md). Delta first, synced to Postgres for the app.
+afterwards. Schema in [SPEC.md §3](SPEC.md). **Written to Lakebase Postgres** — billing bronze is already there, so every join the UI and the finance view need is local.
 
 The three columns that carry the weight: **`prompt_version`**, **`blind`**, **`attribution`**.
 

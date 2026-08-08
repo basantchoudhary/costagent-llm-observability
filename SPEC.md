@@ -10,7 +10,7 @@ Nine decisions on the table. **Nothing is agreed until you say so.**
 
 | # | Decision | Status |
 |---|---|---|
-| **D1** | `llm_calls` written to **Delta in UC**, synced to Postgres — not written to Postgres directly | open |
+| **D1** | `llm_calls` lives in **Lakebase Postgres** — billing bronze is already there, so the join is local | **corrected** |
 | **D2** | Correlate by **capturing the response `id`** into `llm_calls` — custom request fields are rejected (**tested**) | **evidence-backed** |
 | **D2b** | Plan for inference tables being **unavailable**. `llm_calls` is the primary record | open · needs Q8 |
 | **D3** | MLflow autolog — **full for the assistant, ~1-in-20 for bulk**. Sampled for readability, not cost | open |
@@ -96,22 +96,36 @@ designs get this wrong by applying one approach to both.
 
 Each has the counter-argument stated, because the counter-arguments are real.
 
-### D1 · `llm_calls` is written to Delta in UC, then served to Postgres
+### D1 · `llm_calls` lives in Lakebase Postgres — one hop, not two
 
-**Not** written directly to Lakebase Postgres.
+**Corrected. The earlier version of this decision was wrong.**
 
-*Why:* the metric that justifies the system — realised saving — needs a join to
-`system.billing.usage`, which lives in Unity Catalog. A Postgres-resident fact table cannot
-join to it without an export. Writing to Delta and syncing to Postgres for the app also
-matches the pipeline's existing shape: everything already lands in Delta and is served
-through Lakebase.
+The original argument was that realised saving needs a join to `system.billing.usage` in
+Unity Catalog, which Postgres cannot reach — so `llm_calls` had to be written to Delta and
+synced.
 
-*Counter:* two hops instead of one, and the UI sees the data only after the sync. If the
-app needs sub-second freshness on LLM telemetry, this is wrong.
+**That argument does not hold: billing usage is already ingested into Lakebase as a bronze
+table.** The join is local. There is no reason for the extra hop.
 
-*Open:* does the existing Lakebase serving sync run on a schedule, or continuously?
+*Revised proposal:* `llm_calls` is written to **Lakebase Postgres**, in the same step that
+makes the call, alongside findings and billing bronze. One store, local joins, no sync lag
+for the UI, and it matches the pattern the pipeline already uses.
 
----
+```
+llm_calls  ⋈  findings  ⋈  billing_bronze        all in Lakebase, all local
+```
+
+*The one thing to watch:* **growth and analytical load.** The table accrues at
+`findings × call_types × runs` — roughly 40k rows a day at 10k findings, so ~15M a year.
+Postgres handles that comfortably, but the quality dashboards run aggregations over it.
+
+*If that becomes a problem later,* mirror to Delta for the analytical views and keep
+Postgres as the write path. **Do not build that now** — it is an optimisation for a load
+that does not exist yet, and building it up front would be exactly the mistake this
+correction removes.
+
+*Practical requirements either way:* partition or retain by date, and index on
+`finding_id`, `run_id` and `called_at`.
 
 ### D2 · Correlate by pulling their id into our table — not pushing ours into their log
 
@@ -288,7 +302,8 @@ carry both — `validate@a3f91c2b` for correctness, plus an optional label for h
 One row per LLM call. Written by the same PySpark step that makes the call.
 
 ```sql
-CREATE TABLE costagent.observability.llm_calls (
+-- Lakebase Postgres, alongside findings and billing bronze
+CREATE TABLE llm_calls (
   -- identity
   call_id           STRING,        -- uuid
   run_id            STRING,        -- pipeline run — the correlation key
@@ -341,14 +356,14 @@ Confirmed: the UI is **Next.js hosted as a Databricks App**, and the persona wor
 |---|---|---|---|
 | **Persona** — reviews findings, judges quality | **Next.js Databricks App** | `llm_calls` via Lakebase Postgres | Is this finding real? Did the recommendation help? |
 | **Engineer** — debugging a bad output | MLflow trace UI | MLflow traces | Why did this specific call go wrong? |
-| **Finance / exec** | A view in the same app | `llm_calls` ⋈ billing | Realised saving, and what the intelligence costs |
+| **Finance / exec** | A view in the same app | `llm_calls` ⋈ findings ⋈ billing bronze — **all local** | Realised saving, and what the intelligence costs |
 
 **The persona will never open MLflow.** That settles two things: traces are an engineering
 tool rather than a product surface, and the blind-then-reveal flow in D4 is **a screen we
 design in Next.js**, not a Databricks feature we switch on.
 
-It also reinforces D1 — `llm_calls` has to reach Postgres for the app *and* Delta for the
-billing join, which is exactly why it is written to Delta and synced.
+It also simplifies D1 — everything the app and the finance view need is already in Lakebase,
+so `llm_calls` belongs there too.
 
 ---
 
@@ -601,7 +616,7 @@ exists; none of it is currently assembled.
 
 | View | Source |
 |---|---|
-| Spend by component: LLM inference · job compute · Lakebase · SQL warehouse · app hosting | `system.billing.usage` + `llm_calls.usd` |
+| Spend by component: LLM inference · job compute · Lakebase · SQL warehouse · app hosting | **billing bronze** + `llm_calls.usd` — one local join |
 | **Spend ÷ savings identified** | The number an exec asks for first |
 | Cost per finding · per **validated** finding · per **accepted** recommendation | `llm_calls` — the second and third are the real unit economics |
 | **Cost per LLM component against its acceptance rate** | The kill/keep decision, evidenced |
@@ -702,7 +717,7 @@ an enhancement rather than a dependency, which is what keeps it replaceable.
 | ~~Q2~~ | ~~Custom request fields?~~ **Tested: rejected with 400.** Only the OpenAI `user` field is accepted. See D2 | closed |
 | Q3 | Are inference tables enabled on CostAgent's endpoints? | Payload capture |
 | **Q8** | **What endpoint type does CostAgent use** — `FOUNDATION_MODEL_API`, provisioned throughput, or a custom served entity? | **D2b.** Foundation-model endpoints could not have inference tables enabled in this workspace |
-| Q4 | Is the Lakebase sync scheduled or continuous? | D1 — UI freshness |
+| ~~Q4~~ | ~~Lakebase sync cadence?~~ **Moot** — `llm_calls` is written directly to Lakebase | closed |
 | Q7 | Does your Databricks tier meter MLflow trace ingestion? | D3 — sampling rate |
 | ~~Q5~~ | ~~Are prompts versioned?~~ **No.** Content-hash versioning is step zero — see D7 | closed |
 | ~~Q6~~ | ~~Who reviews findings, and where?~~ **No flow exists.** We build it in the Next.js app — see D4 | closed |
