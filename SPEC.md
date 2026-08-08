@@ -372,7 +372,7 @@ so `llm_calls` belongs there too.
 | Signal | Store | Why there |
 |---|---|---|
 | Raw request/response payload | **AI Gateway inference table** | Free, zero code, governed |
-| Per-call facts + outcomes | **`llm_calls` (Delta → Postgres)** | The domain layer. Nothing else can supply it |
+| Per-call facts + outcomes | **`llm_calls` (Lakebase Postgres)** | The domain layer. Joins locally to findings and billing bronze |
 | Traces (assistant; sampled bulk) | **MLflow** | Span structure for multi-step runs |
 | Endpoint spend | **`system.serving.*`** | Already there |
 | Quality metrics | Computed views over `llm_calls` | Derived, not stored twice |
